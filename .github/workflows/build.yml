@@ -1,92 +1,67 @@
-name: Build libc++ dylib for iOS
+name: Build libc++ dylib
 
 on:
   push:
     branches: [ main ]
-  pull_request:
-    branches: [ main ]
   workflow_dispatch:
     inputs:
-      ios_deployment_target:
-        description: 'iOS 部署目标版本'
+      deploy_target:
+        description: "iOS 部署目标"
         required: false
-        default: '13.0'
+        default: "13.0"
       llvm_ref:
-        description: 'LLVM 版本分支'
+        description: "LLVM 版本"
         required: false
-        default: 'release/17.x'
-      dylib_install_name:
-        description: 'dylib 的 install_name（推荐 @loader_path）'
+        default: "release/17.x"
+      install_name:
+        description: "dylib install_name"
         required: false
-        default: '@loader_path/libc++.1.dylib'
+        default: "/usr/lib/libc++.custom.1.dylib"
 
 jobs:
   build:
-    name: Build libc++ dylib (arm64)
     runs-on: macos-13
-
     env:
-      DEPLOYMENT_TARGET: ${{ github.event.inputs.ios_deployment_target || '13.0' }}
-      LLVM_REF: ${{ github.event.inputs.llvm_ref || 'release/17.x' }}
-      INSTALL_NAME: ${{ github.event.inputs.dylib_install_name || '@loader_path/libc++.1.dylib' }}
+      TARGET: ${{ github.event.inputs.deploy_target || '13.0' }}
+      REF: ${{ github.event.inputs.llvm_ref || 'release/17.x' }}
+      INAME: ${{ github.event.inputs.install_name || '/usr/lib/libc++.custom.1.dylib' }}
 
     steps:
-      # ── 1. 检出 LLVM 源码 ──────────────────────────────────────────
-      - name: Checkout LLVM source
+      # 检出 LLVM 源码
+      - name: Checkout LLVM
         uses: actions/checkout@v4
         with:
           repository: llvm/llvm-project
-          path: llvm-project
-          ref: ${{ env.LLVM_REF }}
+          path: src
+          ref: ${{ env.REF }}
           fetch-depth: 1
 
-      # ── 2. 设置 Xcode 环境 ─────────────────────────────────────────
-      - name: Select Xcode
+      # 选择 Xcode 版本
+      - name: Setup Xcode
         uses: maxim-lobanov/setup-xcode@v1
         with:
-          xcode-version: '15.2'
+          xcode-version: "15.2"
 
-      - name: Install build tools
+      # 安装 cmake 和 ninja
+      - name: Install tools
+        run: brew install cmake ninja
+
+      # 获取 iPhone SDK 路径
+      - name: Get SDK path
+        run: echo "SDK=$(xcrun --sdk iphoneos --show-sdk-path)" >> "${GITHUB_ENV}"
+
+      # CMake 交叉编译配置
+      - name: Configure
         run: |
-          brew install cmake ninja
-
-      # ── 3. 验证 SDK 可用性 ─────────────────────────────────────────
-      - name: Verify iPhone SDK
-        run: |
-          echo "=== 可用 SDK 列表 ==="
-          xcodebuild -showsdks | grep -E 'iphoneos|iOS'
-          echo ""
-          echo "=== iPhone SDK 路径 ==="
-          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
-          echo "SDK 路径: ${SDK_PATH}"
-          echo "SDK_PATH=${SDK_PATH}" >> "${GITHUB_ENV}"
-          echo ""
-          echo "=== SDK 版本 ==="
-          xcrun --sdk iphoneos --show-sdk-version
-          echo ""
-          echo "=== 部署目标 ==="
-          echo "DEPLOYMENT_TARGET=${DEPLOYMENT_TARGET}"
-          echo ""
-          if [ ! -d "${SDK_PATH}" ]; then
-            echo "错误: iPhone SDK 路径不存在"
-            exit 1
-          fi
-          echo "SDK 验证通过"
-
-      # ── 4. CMake 配置（arm64） ─────────────────────────────────────
-      - name: Configure CMake for iOS arm64
-        run: |
-          mkdir -p build/arm64
-          cd build/arm64
-
-          cmake ../../llvm-project/runtimes \
+          mkdir -p build && cd build
+          cmake ../src/runtimes \
             -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_OSX_ARCHITECTURES=arm64 \
-            -DCMAKE_OSX_SYSROOT="${SDK_PATH}" \
+            -DCMAKE_OSX_SYSROOT="${SDK}" \
             -DCMAKE_SYSTEM_NAME=iOS \
-            -DCMAKE_OSX_DEPLOYMENT_TARGET="${DEPLOYMENT_TARGET}" \
-            -DCMAKE_INSTALL_PREFIX="${GITHUB_WORKSPACE}/build/install/arm64" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="${TARGET}" \
+            -DCMAKE_INSTALL_PREFIX="${GITHUB_WORKSPACE}/install" \
             -DLLVM_ENABLE_RUNTIMES="libcxx;libcxxabi;libunwind" \
             -DLIBCXX_ENABLE_SHARED=ON \
             -DLIBCXX_ENABLE_STATIC=OFF \
@@ -102,176 +77,30 @@ jobs:
             -DLIBCXXABI_INCLUDE_TESTS=OFF \
             -DLIBUNWIND_INCLUDE_TESTS=OFF
 
-      # ── 5. 构建 ────────────────────────────────────────────────────
-      - name: Build libc++
+      # 编译
+      - name: Build
+        run: cd build && ninja cxx cxxabi unwind
+
+      # 安装到临时目录
+      - name: Install
+        run: cd build && ninja install-cxx install-cxxabi install-unwind
+
+      # 修正 install_name
+      - name: Fix install_name
         run: |
-          cd build/arm64
-          ninja cxx cxxabi unwind
+          DYLIB="${GITHUB_WORKSPACE}/install/lib/libc++.1.dylib"
+          install_name_tool -id "${INAME}" "${DYLIB}"
 
-      # ── 6. 安装到临时目录 ──────────────────────────────────────────
-      - name: Install libraries
-        run: |
-          cd build/arm64
-          ninja install-cxx install-cxxabi install-unwind
-
-      # ── 7. 修改 install_name ───────────────────────────────────────
-      - name: Fix install_name for jailbreak environment
-        run: |
-          DYLIB="${GITHUB_WORKSPACE}/build/install/arm64/lib/libc++.1.dylib"
-
-          echo "=== 修改前 install_name ==="
-          otool -D "${DYLIB}" || true
-
-          echo ""
-          echo "=== 设置 install_name 为: ${INSTALL_NAME} ==="
-          install_name_tool -id "${INSTALL_NAME}" "${DYLIB}"
-
-          echo ""
-          echo "=== 修改后 install_name ==="
-          otool -D "${DYLIB}"
-
-          echo ""
-          echo "=== 修改后依赖关系 ==="
-          otool -L "${DYLIB}"
-
-      # ── 8. 产物验证 ────────────────────────────────────────────────
-      - name: Validate build artifacts
-        run: |
-          DYLIB="${GITHUB_WORKSPACE}/build/install/arm64/lib/libc++.1.dylib"
-
-          echo "=========================================="
-          echo "  产物验证"
-          echo "=========================================="
-
-          echo ""
-          echo "【架构信息】"
-          lipo -info "${DYLIB}"
-
-          echo ""
-          echo "【install_name (LC_ID_DYLIB)】"
-          otool -D "${DYLIB}"
-
-          echo ""
-          echo "【依赖库列表】"
-          otool -L "${DYLIB}"
-
-          echo ""
-          echo "【部署目标版本】"
-          otool -l "${DYLIB}" | grep -A3 -E 'LC_VERSION_MIN|LC_BUILD_VERSION' | grep -E 'version|minos|platform'
-
-          echo ""
-          echo "【文件大小】"
-          ls -lh "${DYLIB}"
-
-          echo ""
-          echo "【符号数量】"
-          nm -g "${DYLIB}" | wc -l
-
-          echo ""
-          echo "=========================================="
-          echo "  验证系统库依赖（应仅依赖系统库）"
-          echo "=========================================="
-          DEPS=$(otool -L "${DYLIB}" | grep -v ':' | grep -v 'libc++' | grep -v '/usr/lib/' | grep -v 'System/Library/')
-          if [ -n "${DEPS}" ]; then
-            echo "警告: 发现非系统依赖:"
-            echo "${DEPS}"
-          else
-            echo "通过: 所有依赖均为系统库"
-          fi
-
-          echo ""
-          echo "=========================================="
-          echo "  检查自包含性（不应依赖 libc++abi.dylib）"
-          echo "=========================================="
-          if otool -L "${DYLIB}" | grep -q 'libc++abi.dylib'; then
-            echo "警告: libc++ dylib 仍然动态依赖 libc++abi.dylib"
-            echo "静态链接可能未生效，请检查 CMake 配置"
-          else
-            echo "通过: libc++ dylib 不依赖独立的 libc++abi.dylib"
-          fi
-
-      # ── 9. 打包产物 ────────────────────────────────────────────────
-      - name: Package libc++-dev
-        run: |
-          PACKAGE_DIR="${GITHUB_WORKSPACE}/libc++-dev-jb"
-          INSTALL_DIR="${GITHUB_WORKSPACE}/build/install/arm64"
-
-          mkdir -p "${PACKAGE_DIR}/lib"
-          mkdir -p "${PACKAGE_DIR}/include"
-          mkdir -p "${PACKAGE_DIR}/docs"
-
-          # 复制 dylib
-          cp "${INSTALL_DIR}/lib/libc++.1.dylib" "${PACKAGE_DIR}/lib/"
-
-          # 复制头文件
-          if [ -d "${INSTALL_DIR}/include/c++" ]; then
-            cp -r "${INSTALL_DIR}/include/c++" "${PACKAGE_DIR}/include/"
-          fi
-
-          # 生成使用说明
-          cat > "${PACKAGE_DIR}/docs/USAGE.md" << 'EOF'
-      # libc++-dev for Jailbroken iOS
-
-      ## 构建信息
-      - 架构: arm64
-      - 部署目标: iOS ${DEPLOYMENT_TARGET}
-      - install_name: ${INSTALL_NAME}
-      - LLVM 版本: ${LLVM_REF}
-
-      ## 在越狱插件中使用
-
-      ### 方式一：Theos / Makefile
-      ```makefile
-      # 将 dylib 放在插件项目目录的 lib/ 下
-      # 或放在 $(THEOS)/vendor/lib/ 下
-      TARGET_CXXFLAGS += -I/path/to/libc++-dev-jb/include/c++/v1
-      TARGET_LDFLAGS  += -L/path/to/libc++-dev-jb/lib -lc++
-
-      # 确保运行时 dylib 与插件在同一目录
-      # 或使用 install_name_tool 调整路径
-      ```
-
-      ### 方式二：手动链接
-      ```bash
-      # 编译时
-      clang++ -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
-              -arch arm64 -miphoneos-version-min=13.0 \
-              -I./libc++-dev-jb/include/c++/v1 \
-              -L./libc++-dev-jb/lib -lc++ \
-              -o MyPlugin.dylib MyPlugin.mm
-
-      # 运行时确保 libc++.1.dylib 与插件在同一目录
-      ```
-
-      ## 注意事项
-      1. 此 dylib 的 install_name 为 `@loader_path/libc++.1.dylib`
-      2. 确保运行时 dylib 与插件可执行文件在同一目录
-      3. 避免与系统 libc++ 混合使用（ODR 问题）
-      4. 此库已静态链接 libc++abi 和 libunwind，无额外依赖
-      EOF
-
-          # 创建压缩包
-          cd "${GITHUB_WORKSPACE}"
-          tar -czf libc++-dev-jb-arm64.tar.gz libc++-dev-jb
-
-          echo "打包完成: libc++-dev-jb-arm64.tar.gz"
-          ls -lh libc++-dev-jb-arm64.tar.gz
-
-      # ── 10. 上传产物 ───────────────────────────────────────────────
-      - name: Upload dylib artifact
+      # 上传产物
+      - name: Upload dylib
         uses: actions/upload-artifact@v4
         with:
-          name: libc++-dylib-arm64
-          path: build/install/arm64/lib/libc++.1.dylib
+          name: libc++.dylib
+          path: install/lib/libc++.1.dylib
 
-      - name: Upload full dev package
-        uses: actions/upload-artifact@v4
-        with:
-          name: libc++-dev-jb-arm64
-          path: libc++-dev-jb-arm64.tar.gz
-
+      # 上传头文件
       - name: Upload headers
         uses: actions/upload-artifact@v4
         with:
           name: libc++-headers
-          path: build/install/arm64/include/
+          path: install/include/
